@@ -62,15 +62,16 @@ def notify(msg: str):
                 timeout=10
             )
         except Exception:
+            # 不让通知失败影响主流程
             traceback.print_exc()
 
 # ---------- OCI clients ----------
 def get_clients():
     cfg = oci.config.from_file(CONFIG_FILE, PROFILE)
     compute = oci.core.ComputeClient(cfg)
-    vcn = oci.core.VirtualNetworkClient(cfg)
+    network = oci.core.VirtualNetworkClient(cfg)
     iam = oci.identity.IdentityClient(cfg)
-    return cfg, compute, vcn, iam
+    return cfg, compute, network, iam
 
 def list_availability_domains(iam, compartment_id) -> List[str]:
     try:
@@ -95,7 +96,7 @@ def pick_latest_ubuntu_arm_image(compute, compartment_id) -> Optional[str]:
     return None
 
 # ---------- 创建实例 ----------
-def try_launch(compute, vcn, compartment_id, image_id, ad_name, ocpus, mem_gb):
+def try_launch(compute, network, compartment_id, image_id, ad_name, ocpus, mem_gb):
     from oci.core.models import (
         LaunchInstanceDetails,
         LaunchInstanceShapeConfigDetails,
@@ -148,11 +149,15 @@ def try_launch(compute, vcn, compartment_id, image_id, ad_name, ocpus, mem_gb):
             succeed_on_not_found=False,
         )
 
-        # 取公网 IP（先查 VNIC 附着，再取 VNIC）
-        atts = compute.list_vnic_attachments(compartment_id=compartment_id, instance_id=inst_id).data
+        # 取公网 IP：Compute 列出 VNIC 附着，再用 Network 拿 VNIC 详情
+        atts = compute.list_vnic_attachments(
+            compartment_id=compartment_id,
+            instance_id=inst_id
+        ).data
         if not atts:
             raise RuntimeError("未找到 VNIC 附着")
-        vnic = vcn.get_vnic(atts[0].vnic_id).data
+        vnic_id = atts[0].vnic_id
+        vnic = network.get_vnic(vnic_id).data
         return inst_id, vnic.public_ip
 
     except oci.exceptions.ServiceError as e:
@@ -160,6 +165,9 @@ def try_launch(compute, vcn, compartment_id, image_id, ad_name, ocpus, mem_gb):
         if any(k in msg for k in ["capacity", "outofhostcapacity", "out of capacity", "insufficient"]):
             raise RuntimeError("CAPACITY")
         raise RuntimeError(f"API:{e.status} {e.code} {e.message}")
+    except Exception as e:
+        # 避免空 except 块导致缩进错误
+        raise RuntimeError(f"EX:{type(e).__name__}: {e}")
 
 # ---------- 主流程 ----------
 def main():
@@ -175,7 +183,7 @@ def main():
         print(f"找不到 SSH 公钥：{SSH_PUBLIC_KEY_PATH}")
         sys.exit(1)
 
-    cfg, compute, vcn, iam = get_clients()
+    cfg, compute, network, iam = get_clients()
     region = cfg["region"]
     notify(f"开始蹲位：区域={region}")
 
@@ -199,7 +207,7 @@ def main():
                 attempt += 1
                 notify(f"[{attempt}] 尝试创建：AD={ad}  {ocpu} OCPU / {mem} GB")
                 try:
-                    inst, ip = try_launch(compute, vcn, COMPARTMENT_OCID, image_id, ad, ocpu, mem)
+                    inst, ip = try_launch(compute, network, COMPARTMENT_OCID, image_id, ad, ocpu, mem)
                     notify(f"✅ 成功！实例：{inst}\n公网 IP：{ip}")
                     with open("SUCCESS.txt", "w", encoding="utf-8") as f:
                         f.write(f"{inst}\n{ip}\n")
@@ -212,3 +220,5 @@ def main():
                         notify(f"❌ 其他错误：{e}\n{SLEEP_SECONDS}s 后继续…")
                         time.sleep(SLEEP_SECONDS)
                 except Exception as e:
+                    notify(f"❌ 异常：{e}\n{SLEEP_SECONDS}s 后继续…")
+                    traceback.print_exc()
