@@ -1,0 +1,97 @@
+name: OCI A1 Auto-Claim
+
+on:
+  workflow_dispatch: {}            # 手动触发
+  schedule:
+    - cron: "*/10 * * * *"         # 每10分钟跑一次（GitHub不保证严格准点）
+
+concurrency:
+  group: oci-a1-autoclaim
+  cancel-in-progress: true         # 新任务来时自动取消上一个，避免并发
+
+permissions:
+  contents: read
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Prepare OCI config & keys
+        shell: bash
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY_PEM: ${{ secrets.OCI_PRIVATE_KEY_PEM }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.oci ~/.ssh
+          # 写私钥
+          printf "%s\n" "$OCI_PRIVATE_KEY_PEM" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          # 写 config
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          key_file=/home/runner/.oci/oci_api_key.pem
+          EOF
+          # 写 SSH 公钥
+          printf "%s\n" "$SSH_PUBLIC_KEY" > ~/.ssh/oci_ed25519.pub
+
+      - name: Generate .env
+        shell: bash
+        env:
+          COMPARTMENT_OCID: ${{ secrets.COMPARTMENT_OCID }}
+          SUBNET_OCID: ${{ secrets.SUBNET_OCID }}
+          IMAGE_OCID: ${{ secrets.IMAGE_OCID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          cat > .env <<EOF
+          OCI_CONFIG_FILE=/home/runner/.oci/config
+          OCI_PROFILE=DEFAULT
+          COMPARTMENT_OCID=${COMPARTMENT_OCID}
+          SUBNET_OCID=${SUBNET_OCID}
+          SSH_PUBLIC_KEY_PATH=/home/runner/.ssh/oci_ed25519.pub
+          IMAGE_OCID=${IMAGE_OCID}
+          INSTANCE_NAME_PREFIX=a1-free
+          BOOT_VOLUME_GB=50
+          SLEEP_SECONDS=120
+          ADS=AD-1,AD-2,AD-3
+          OCPUS=4,2,1
+          MEM_PER_OCPU=6
+          TG_BOT_TOKEN=${TG_BOT_TOKEN}
+          TG_CHAT_ID=${TG_CHAT_ID}
+          EOF
+          echo "==== .env created ===="
+          sed -n '1,6p' .env
+
+      - name: Run auto-claim
+        run: |
+          python oci_a1_autoclaim.py
+
+      - name: Upload SUCCESS.txt (if any)
+        if: always() && exists('SUCCESS.txt')
+        uses: actions/upload-artifact@v4
+        with:
+          name: success
+          path: SUCCESS.txt
