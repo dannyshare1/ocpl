@@ -2,8 +2,10 @@ name: OCI A1 Auto-Claim
 
 on:
   workflow_dispatch: {}
+  push:
+    branches: [ "main" ]   # 往 main 推就触发
   # schedule:
-  #   - cron: "*/10 * * * *"   # 确认无误后再打开定时
+  #   - cron: "*/10 * * * *"  # 确认无误后再打开定时
 
 concurrency:
   group: oci-a1-autoclaim
