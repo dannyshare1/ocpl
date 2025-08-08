@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OCI A1 (ARM) Always Free 自动蹲位脚本（带环境自检）
+OCI A1 (ARM) Always Free 自动蹲位脚本（带环境自检 & 自动选择子网）
 """
 
 import base64
@@ -8,18 +8,19 @@ import os
 import sys
 import time
 import traceback
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import oci
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ---- 配置/环境变量 ----
 CONFIG_FILE = os.path.expanduser(os.getenv("OCI_CONFIG_FILE", "~/.oci/config"))
 PROFILE = os.getenv("OCI_PROFILE", "DEFAULT")
 
 COMPARTMENT_OCID = os.getenv("COMPARTMENT_OCID")
-SUBNET_OCID = os.getenv("SUBNET_OCID")
+SUBNET_OCID_ENV = os.getenv("SUBNET_OCID")  # 可能为空或填错
 SSH_PUBLIC_KEY_PATH = os.path.expanduser(os.getenv("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_rsa.pub"))
 
 IMAGE_OCID_OVERRIDE = (os.getenv("IMAGE_OCID") or "").strip()
@@ -35,6 +36,9 @@ MEM_PER_OCPU = int(os.getenv("MEM_PER_OCPU", "6"))
 TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or "").strip()
 TG_CHAT_ID = (os.getenv("TG_CHAT_ID") or "").strip()
 
+# 自动寻找子网（当 SUBNET_OCID 无效时）。设为 "0" 可关闭。
+AUTO_FIND_SUBNET = (os.getenv("AUTO_FIND_SUBNET", "1").strip().lower() in ("1", "true", "yes", "y", "on"))
+
 CLOUD_INIT = """#cloud-config
 package_update: true
 packages: [curl, htop]
@@ -43,6 +47,7 @@ runcmd:
   - ufw disable || true
 """
 
+# ---- 基础工具 ----
 def notify(msg: str):
     print(msg, flush=True)
     if TG_BOT_TOKEN and TG_CHAT_ID:
@@ -89,57 +94,107 @@ def pick_latest_ubuntu_arm_image(compute, compartment_id) -> Optional[str]:
 
     return pick("22.04") or pick("24.04")
 
-def validate_environment(cfg, compute, network, iam):
-    """在尝试创建实例前做全面自检，定位 404/权限错误的根因"""
+# ---- 子网处理 ----
+def list_subnets_in_compartment(network, compartment_id) -> List[oci.core.models.Subnet]:
+    subs = oci.pagination.list_call_get_all_results(
+        network.list_subnets, compartment_id=compartment_id
+    ).data
+    # 仅保留可用状态
+    return [s for s in subs if (getattr(s, "lifecycle_state", "AVAILABLE") == "AVAILABLE")]
+
+def describe_subnet(s: oci.core.models.Subnet) -> str:
+    allow_pub = not bool(getattr(s, "prohibit_public_ip_on_vnic", False))
+    ad = getattr(s, "availability_domain", None) or "REGIONAL"
+    return f"- {s.display_name or '(no-name)'} | {s.id} | AD={ad} | allowPublicIP={'Y' if allow_pub else 'N'}"
+
+def resolve_subnet(network, compartment_id, region, wanted_subnet_id: Optional[str]) -> Tuple[str, bool]:
+    """
+    返回 (subnet_id, is_auto_picked)
+    - 如果 wanted_subnet_id 有效 -> 直接返回它
+    - 否则若 AUTO_FIND_SUBNET 开启 -> 自动挑一个允许公网 IP 的；否则抛错
+    """
+    # 先尝试用户提供的
+    if wanted_subnet_id:
+        try:
+            s = network.get_subnet(wanted_subnet_id).data
+            allow_pub = not bool(getattr(s, "prohibit_public_ip_on_vnic", False))
+            notify("已验证 SUBNET_OCID：\n" + describe_subnet(s))
+            if not allow_pub:
+                notify("⚠️ 该子网不允许分配公网 IP（prohibit_public_ip_on_vnic=True），仍可继续，但将尝试强制分配公网 IP。")
+            return wanted_subnet_id, False
+        except oci.exceptions.ServiceError as e:
+            if e.status != 404:
+                raise
+            notify("⚠️ 提供的 SUBNET_OCID 在当前 region 不存在或不可见（404）。")
+
+    # 自动寻找
+    subs = list_subnets_in_compartment(network, compartment_id)
+    if not subs:
+        raise RuntimeError(
+            "找不到任何子网。请在当前 region 创建 VCN/Subnet，或把现有子网的 OCID 填到 SUBNET_OCID。"
+        )
+
+    notify("当前 compartment 可见子网清单（region=" + region + "）：\n" + "\n".join(describe_subnet(s) for s in subs))
+
+    if not AUTO_FIND_SUBNET:
+        raise RuntimeError("AUTO_FIND_SUBNET=0，且提供的 SUBNET_OCID 无效，停止。")
+
+    # 优先允许公网 IP 的
+    cand = [s for s in subs if not bool(getattr(s, "prohibit_public_ip_on_vnic", False))]
+    chosen = (sorted(cand, key=lambda s: (s.display_name or s.id)) or
+              sorted(subs, key=lambda s: (s.display_name or s.id)))[0]
+    notify("将自动使用子网：\n" + describe_subnet(chosen))
+    return chosen.id, True
+
+# ---- 核验/启动 ----
+def validate_environment(cfg, compute, network, iam) -> Tuple[str, Optional[str]]:
+    """返回 (resolved_subnet_id, resolved_image_id_or_None)"""
     region = cfg.get("region")
     notify(f"区域(region) = {region}")
-    # 1) 当前 API key 所属用户/租户
+
+    # 1) 当前用户/租户
     try:
         whoami = iam.get_user(cfg["user"]).data
         notify(f"当前用户: {whoami.name} ({whoami.id})")
     except Exception as e:
         raise RuntimeError(f"无法读取当前用户信息，请检查 OCI 配置/密钥是否正确：{e}")
 
-    # 2) compartment 是否存在且可见
+    # 2) compartment
     try:
         comp = iam.get_compartment(COMPARTMENT_OCID).data
         notify(f"Compartment: {comp.name} ({comp.id}) - 状态: {comp.lifecycle_state}")
     except oci.exceptions.ServiceError as e:
         if e.status == 404:
-            raise RuntimeError("找不到 COMPARTMENT_OCID（不在本租户/本区域可见），或无读取权限（需要 'read tenancy' 或对该 compartment 的 read 权限）。")
+            raise RuntimeError("找不到 COMPARTMENT_OCID（不在本租户/本区域可见），或无读取权限。")
         raise
 
-    # 3) subnet 是否存在（且通常是区域级资源，必须在同一个 region）
-    try:
-        subnet = network.get_subnet(SUBNET_OCID).data
-        notify(f"Subnet: {subnet.display_name} ({subnet.id}) - VCN: {subnet.vcn_id}")
-    except oci.exceptions.ServiceError as e:
-        if e.status == 404:
-            raise RuntimeError("找不到 SUBNET_OCID：请确认该 Subnet 位于当前 region，且你有 use virtual-network-family 权限。")
-        raise
+    # 3) subnet（支持自动选择）
+    subnet_id, auto_picked = resolve_subnet(network, COMPARTMENT_OCID, region, SUBNET_OCID_ENV)
 
-    # 4) image 是否存在（若提供了 override）
+    # 4) image（若 override 则校验）
     if IMAGE_OCID_OVERRIDE:
         try:
             img = compute.get_image(IMAGE_OCID_OVERRIDE).data
             notify(f"指定镜像 OK: {img.display_name} ({img.id})")
+            resolved_image = IMAGE_OCID_OVERRIDE
         except oci.exceptions.ServiceError as e:
             if e.status == 404:
                 raise RuntimeError("找不到 IMAGE_OCID：很可能是别的 region 的镜像 ID；建议留空由脚本自动选择。")
             raise
+    else:
+        resolved_image = None
 
-    # 5) 权限建议：多数 404 实为权限不足
-    #   - manage instance-family + use virtual-network-family in compartment
-    #   - read tenancy (便于读取 AD、compartment 信息)
+    # 权限提示
     notify(
         "权限提示：若仍报 404/授权失败，请为你所在的 Group 在目标 compartment 配置：\n"
         "  allow group <YourGroup> to manage instance-family in compartment <YourCompartment>\n"
         "  allow group <YourGroup> to use virtual-network-family in compartment <YourCompartment>\n"
-        "  allow group <YourGroup> to read tenancy\n"
-        "并确认 Subnet/Compartment/镜像与当前 region 一致。"
+        "  allow group <YourGroup> to read tenancy"
     )
 
-def try_launch(compute, network, compartment_id, image_id, ad_name, ocpus, mem_gb):
+    return subnet_id, resolved_image
+
+def try_launch(compute, network, compartment_id, subnet_id, image_id, ad_name, ocpus, mem_gb):
     from oci.core.models import (
         LaunchInstanceDetails,
         LaunchInstanceShapeConfigDetails,
@@ -170,7 +225,7 @@ def try_launch(compute, network, compartment_id, image_id, ad_name, ocpus, mem_g
             memory_in_gbs=mem_gb
         ),
         create_vnic_details=CreateVnicDetails(
-            subnet_id=SUBNET_OCID,
+            subnet_id=subnet_id,
             assign_public_ip=True
         ),
         metadata=md,
@@ -202,19 +257,18 @@ def try_launch(compute, network, compartment_id, image_id, ad_name, ocpus, mem_g
 
     except oci.exceptions.ServiceError as e:
         msg = (e.message or "").lower()
-        # 404、授权失败等
         if e.status == 404 or "notauthorized" in msg or "not found" in msg:
-            raise RuntimeError("AUTH_OR_NOTFOUND: 请检查 COMPARTMENT_OCID / SUBNET_OCID / IMAGE_OCID 是否在本 region 且你有权限。")
+            raise RuntimeError("AUTH_OR_NOTFOUND: 请检查 region/OCID/权限（子网/镜像/AD）。")
         if any(k in msg for k in ["capacity", "outofhostcapacity", "out of capacity", "insufficient"]):
             raise RuntimeError("CAPACITY")
         raise RuntimeError(f"API:{e.status} {e.code} {e.message}")
     except Exception as e:
         raise RuntimeError(f"EX:{type(e).__name__}: {e}")
 
+# ---- 主流程 ----
 def main():
     miss = []
     if not COMPARTMENT_OCID: miss.append("COMPARTMENT_OCID")
-    if not SUBNET_OCID: miss.append("SUBNET_OCID")
     if miss:
         print("缺少必要环境变量：", ", ".join(miss))
         sys.exit(1)
@@ -227,9 +281,9 @@ def main():
     region = cfg["region"]
     notify(f"开始蹲位：区域={region}")
 
-    # 先做自检，把 404/权限问题前置暴露
+    # 自检 + 解析子网/镜像
     try:
-        validate_environment(cfg, compute, network, iam)
+        subnet_id, image_override = validate_environment(cfg, compute, network, iam)
     except Exception as e:
         notify(f"❌ 环境自检失败：{e}")
         traceback.print_exc()
@@ -238,11 +292,12 @@ def main():
     real_ads = list_availability_domains(iam, COMPARTMENT_OCID)
     ad_order = [ad for ad in ADS if any(ad == r for r in real_ads)] or real_ads or ADS
 
-    image_id = IMAGE_OCID_OVERRIDE or pick_latest_ubuntu_arm_image(compute, COMPARTMENT_OCID)
+    image_id = image_override or pick_latest_ubuntu_arm_image(compute, COMPARTMENT_OCID)
     if not image_id:
         notify("未找到 Ubuntu 22.04/24.04 ARM 镜像。建议在 Secrets 里设置 IMAGE_OCID。")
         sys.exit(0)  # 正常结束，留 run.log
 
+    notify(f"使用子网：{subnet_id}")
     attempt = 0
     while True:
         for ad in ad_order:
@@ -251,7 +306,7 @@ def main():
                 attempt += 1
                 notify(f"[{attempt}] 尝试创建：AD={ad}  {ocpu} OCPU / {mem} GB")
                 try:
-                    inst, ip = try_launch(compute, network, COMPARTMENT_OCID, image_id, ad, ocpu, mem)
+                    inst, ip = try_launch(compute, network, COMPARTMENT_OCID, subnet_id, image_id, ad, ocpu, mem)
                     notify(f"✅ 成功！实例：{inst}\n公网 IP：{ip}")
                     with open("SUCCESS.txt", "w", encoding="utf-8") as f:
                         f.write(f"{inst}\n{ip}\n")
@@ -262,7 +317,7 @@ def main():
                         notify(f"⚠️ 容量不足（{ad} {ocpu}c/{mem}g），{SLEEP_SECONDS}s 后继续…")
                         time.sleep(SLEEP_SECONDS)
                     elif msg.startswith("AUTH_OR_NOTFOUND"):
-                        notify("❌ 授权/资源不可见问题：请检查 region/OCID/权限（见上方自检提示），脚本将暂停。")
+                        notify("❌ 授权/资源不可见问题：请检查 region/OCID/权限（见上方自检/子网清单），脚本将暂停。")
                         return
                     else:
                         notify(f"❌ 其他错误：{e}\n{SLEEP_SECONDS}s 后继续…")
