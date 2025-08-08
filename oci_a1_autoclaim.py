@@ -4,6 +4,7 @@ OCI A1 (ARM) Always Free 自动蹲位脚本
 - 自检 compartment / subnet / image
 - SUBNET 不在当前 region 时，自动遍历租户已订阅的 region 定位并切换
 - 当前 region 无子网时，打印清单便于填写
+- 只在成功时推送 Telegram
 """
 
 import base64
@@ -53,6 +54,11 @@ runcmd:
 
 # ========= 基础工具 =========
 def notify(msg: str):
+    """仅打印，不推送（按需节省 TG 噪音）。"""
+    print(msg, flush=True)
+
+def success_notify(msg: str):
+    """成功时打印 + 推送到 Telegram（若配置了 TG_*）。"""
     print(msg, flush=True)
     if TG_BOT_TOKEN and TG_CHAT_ID:
         try:
@@ -355,7 +361,7 @@ def main():
                 notify(f"[{attempt}] 尝试创建：AD={ad}  {ocpu} OCPU / {mem} GB")
                 try:
                     inst, ip = try_launch(compute, network, COMPARTMENT_OCID, subnet_id, image_id, ad, ocpu, mem)
-                    notify(f"✅ 成功！实例：{inst}\n公网 IP：{ip}")
+                    success_notify(f"✅ 成功！实例：{inst}\n公网 IP：{ip}")
                     with open("SUCCESS.txt", "w", encoding="utf-8") as f:
                         f.write(f"{inst}\n{ip}\n")
                     return
