@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-OCI A1 (ARM) Always Free 自动蹲位脚本（带环境自检 & 自动选择子网）
+OCI A1 (ARM) Always Free 自动蹲位脚本
+- 自检 compartment / subnet / image
+- SUBNET 不在当前 region 时，自动遍历租户已订阅的 region 定位并切换
+- 当前 region 无子网时，打印清单便于填写
 """
 
 import base64
@@ -15,12 +18,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ---- 配置/环境变量 ----
+# ========= 环境变量 =========
 CONFIG_FILE = os.path.expanduser(os.getenv("OCI_CONFIG_FILE", "~/.oci/config"))
 PROFILE = os.getenv("OCI_PROFILE", "DEFAULT")
 
 COMPARTMENT_OCID = os.getenv("COMPARTMENT_OCID")
-SUBNET_OCID_ENV = os.getenv("SUBNET_OCID")  # 可能为空或填错
+SUBNET_OCID_ENV = os.getenv("SUBNET_OCID")  # 可为空或来自其他 region
 SSH_PUBLIC_KEY_PATH = os.path.expanduser(os.getenv("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_rsa.pub"))
 
 IMAGE_OCID_OVERRIDE = (os.getenv("IMAGE_OCID") or "").strip()
@@ -36,8 +39,9 @@ MEM_PER_OCPU = int(os.getenv("MEM_PER_OCPU", "6"))
 TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or "").strip()
 TG_CHAT_ID = (os.getenv("TG_CHAT_ID") or "").strip()
 
-# 自动寻找子网（当 SUBNET_OCID 无效时）。设为 "0" 可关闭。
+# 行为开关
 AUTO_FIND_SUBNET = (os.getenv("AUTO_FIND_SUBNET", "1").strip().lower() in ("1", "true", "yes", "y", "on"))
+AUTO_SWITCH_REGION = (os.getenv("AUTO_SWITCH_REGION", "1").strip().lower() in ("1", "true", "yes", "y", "on"))
 
 CLOUD_INIT = """#cloud-config
 package_update: true
@@ -47,7 +51,7 @@ runcmd:
   - ufw disable || true
 """
 
-# ---- 基础工具 ----
+# ========= 基础工具 =========
 def notify(msg: str):
     print(msg, flush=True)
     if TG_BOT_TOKEN and TG_CHAT_ID:
@@ -61,12 +65,19 @@ def notify(msg: str):
         except Exception:
             traceback.print_exc()
 
-def get_clients():
-    cfg = oci.config.from_file(CONFIG_FILE, PROFILE)
+def make_clients(cfg: dict):
     compute = oci.core.ComputeClient(cfg)
     network = oci.core.VirtualNetworkClient(cfg)
     iam = oci.identity.IdentityClient(cfg)
-    return cfg, compute, network, iam
+    return compute, network, iam
+
+def clone_cfg_with_region(cfg: dict, region: str) -> dict:
+    new_cfg = dict(cfg)
+    new_cfg["region"] = region
+    return new_cfg
+
+def get_base_cfg() -> dict:
+    return oci.config.from_file(CONFIG_FILE, PROFILE)
 
 def list_availability_domains(iam, compartment_id) -> List[str]:
     try:
@@ -76,7 +87,6 @@ def list_availability_domains(iam, compartment_id) -> List[str]:
         return ADS
 
 def pick_latest_ubuntu_arm_image(compute, compartment_id) -> Optional[str]:
-    """优先 22.04，找不到再回退 24.04；匹配 aarch64/arm 关键字"""
     imgs = oci.pagination.list_call_get_all_results(
         compute.list_images,
         compartment_id=compartment_id,
@@ -94,12 +104,11 @@ def pick_latest_ubuntu_arm_image(compute, compartment_id) -> Optional[str]:
 
     return pick("22.04") or pick("24.04")
 
-# ---- 子网处理 ----
+# ========= 子网处理 =========
 def list_subnets_in_compartment(network, compartment_id) -> List[oci.core.models.Subnet]:
     subs = oci.pagination.list_call_get_all_results(
         network.list_subnets, compartment_id=compartment_id
     ).data
-    # 仅保留可用状态
     return [s for s in subs if (getattr(s, "lifecycle_state", "AVAILABLE") == "AVAILABLE")]
 
 def describe_subnet(s: oci.core.models.Subnet) -> str:
@@ -107,84 +116,121 @@ def describe_subnet(s: oci.core.models.Subnet) -> str:
     ad = getattr(s, "availability_domain", None) or "REGIONAL"
     return f"- {s.display_name or '(no-name)'} | {s.id} | AD={ad} | allowPublicIP={'Y' if allow_pub else 'N'}"
 
-def resolve_subnet(network, compartment_id, region, wanted_subnet_id: Optional[str]) -> Tuple[str, bool]:
-    """
-    返回 (subnet_id, is_auto_picked)
-    - 如果 wanted_subnet_id 有效 -> 直接返回它
-    - 否则若 AUTO_FIND_SUBNET 开启 -> 自动挑一个允许公网 IP 的；否则抛错
-    """
-    # 先尝试用户提供的
+def resolve_subnet_in_region(network, compartment_id, region: str, wanted_subnet_id: Optional[str]) -> Tuple[Optional[str], List[str]]:
+    """在指定 region 尝试解析子网，返回(子网ID或None, 该region下子网清单文本行列表)"""
+    lines: List[str] = []
+    # 先看传入的 SUBNET_OCID 是否存在于本 region
     if wanted_subnet_id:
         try:
             s = network.get_subnet(wanted_subnet_id).data
-            allow_pub = not bool(getattr(s, "prohibit_public_ip_on_vnic", False))
-            notify("已验证 SUBNET_OCID：\n" + describe_subnet(s))
-            if not allow_pub:
-                notify("⚠️ 该子网不允许分配公网 IP（prohibit_public_ip_on_vnic=True），仍可继续，但将尝试强制分配公网 IP。")
-            return wanted_subnet_id, False
+            lines.append("已在本 region 定位到提供的 SUBNET_OCID：")
+            lines.append(describe_subnet(s))
+            return s.id, lines
         except oci.exceptions.ServiceError as e:
             if e.status != 404:
                 raise
-            notify("⚠️ 提供的 SUBNET_OCID 在当前 region 不存在或不可见（404）。")
 
-    # 自动寻找
+    # 列表用于提示
     subs = list_subnets_in_compartment(network, compartment_id)
-    if not subs:
-        raise RuntimeError(
-            "找不到任何子网。请在当前 region 创建 VCN/Subnet，或把现有子网的 OCID 填到 SUBNET_OCID。"
-        )
+    if subs:
+        lines.append(f"region={region} 下可见子网：")
+        lines += [describe_subnet(s) for s in subs]
+    else:
+        lines.append(f"region={region} 下未发现任何子网。")
+    return None, lines
 
-    notify("当前 compartment 可见子网清单（region=" + region + "）：\n" + "\n".join(describe_subnet(s) for s in subs))
+# ========= 核验/启动 =========
+def validate_and_maybe_switch_region(base_cfg) -> Tuple[dict, str, str, Optional[str]]:
+    """
+    返回: (最终 cfg, 最终 region, 解析出来的 subnet_id, image_override 或 None)
+    - 若 SUBNET_OCID 在其他 region，且 AUTO_SWITCH_REGION=1，会自动切换 cfg.region
+    """
+    cfg = dict(base_cfg)
+    region = cfg["region"]
+    compute, network, iam = make_clients(cfg)
 
-    if not AUTO_FIND_SUBNET:
-        raise RuntimeError("AUTO_FIND_SUBNET=0，且提供的 SUBNET_OCID 无效，停止。")
-
-    # 优先允许公网 IP 的
-    cand = [s for s in subs if not bool(getattr(s, "prohibit_public_ip_on_vnic", False))]
-    chosen = (sorted(cand, key=lambda s: (s.display_name or s.id)) or
-              sorted(subs, key=lambda s: (s.display_name or s.id)))[0]
-    notify("将自动使用子网：\n" + describe_subnet(chosen))
-    return chosen.id, True
-
-# ---- 核验/启动 ----
-def validate_environment(cfg, compute, network, iam) -> Tuple[str, Optional[str]]:
-    """返回 (resolved_subnet_id, resolved_image_id_or_None)"""
-    region = cfg.get("region")
     notify(f"区域(region) = {region}")
 
-    # 1) 当前用户/租户
+    # 用户/租户
     try:
         whoami = iam.get_user(cfg["user"]).data
         notify(f"当前用户: {whoami.name} ({whoami.id})")
     except Exception as e:
         raise RuntimeError(f"无法读取当前用户信息，请检查 OCI 配置/密钥是否正确：{e}")
 
-    # 2) compartment
+    # Compartment / Tenancy 兼容输出
     try:
-        comp = iam.get_compartment(COMPARTMENT_OCID).data
-        notify(f"Compartment: {comp.name} ({comp.id}) - 状态: {comp.lifecycle_state}")
+        if COMPARTMENT_OCID and COMPARTMENT_OCID.startswith("ocid1.tenancy"):
+            ten = iam.get_tenancy(COMPARTMENT_OCID).data
+            notify(f"Tenancy (作为根 compartment 使用): {ten.name} ({ten.id}) - 状态: {ten.lifecycle_state}")
+        else:
+            comp = iam.get_compartment(COMPARTMENT_OCID).data
+            notify(f"Compartment: {comp.name} ({comp.id}) - 状态: {comp.lifecycle_state}")
     except oci.exceptions.ServiceError as e:
         if e.status == 404:
             raise RuntimeError("找不到 COMPARTMENT_OCID（不在本租户/本区域可见），或无读取权限。")
         raise
 
-    # 3) subnet（支持自动选择）
-    subnet_id, auto_picked = resolve_subnet(network, COMPARTMENT_OCID, region, SUBNET_OCID_ENV)
+    # 优先在当前 region 解析 SUBNET
+    subnet_id, lines = resolve_subnet_in_region(network, COMPARTMENT_OCID, region, SUBNET_OCID_ENV)
+    for ln in lines:
+        notify(ln)
 
-    # 4) image（若 override 则校验）
+    if subnet_id is None and SUBNET_OCID_ENV and AUTO_SWITCH_REGION:
+        # 在已订阅的其它 region 里寻找这个 SUBNET_OCID
+        notify("在当前 region 未找到提供的 SUBNET_OCID，开始遍历租户已订阅的其它 region …")
+        subs = iam.list_region_subscriptions(cfg["tenancy"]).data
+        for rs in subs:
+            rname = rs.region_name
+            if rname == region:
+                continue
+            try:
+                cfg_try = clone_cfg_with_region(cfg, rname)
+                _, network_try, _ = make_clients(cfg_try)
+                s = network_try.get_subnet(SUBNET_OCID_ENV).data
+                notify(f"✅ 在 region={rname} 找到了提供的 SUBNET_OCID。将自动切换到该 region 继续。")
+                cfg = cfg_try
+                region = rname
+                subnet_id = s.id
+                break
+            except oci.exceptions.ServiceError as e:
+                if e.status != 404:
+                    raise
+
+        if subnet_id is None:
+            raise RuntimeError(
+                "提供的 SUBNET_OCID 在任何已订阅 region 都未找到。请确认 OCID 是否正确，或在目标 region 创建子网。"
+            )
+
+    # 如果没提供 SUBNET_OCID，且当前 region 有子网，则自动挑一个允许公网 IP 的
+    if subnet_id is None and AUTO_FIND_SUBNET:
+        subs_now = list_subnets_in_compartment(network, COMPARTMENT_OCID)
+        if not subs_now:
+            raise RuntimeError(
+                "当前 region 下没有任何子网。请先创建 VCN/公共子网，或提供 SUBNET_OCID。"
+            )
+        cand = [s for s in subs_now if not bool(getattr(s, "prohibit_public_ip_on_vnic", False))]
+        chosen = (sorted(cand, key=lambda s: (s.display_name or s.id)) or
+                  sorted(subs_now, key=lambda s: (s.display_name or s.id)))[0]
+        notify("AUTO_FIND_SUBNET 已开启，将使用：\n" + describe_subnet(chosen))
+        subnet_id = chosen.id
+
+    # 校验镜像 override（若提供）
+    image_override = None
     if IMAGE_OCID_OVERRIDE:
         try:
             img = compute.get_image(IMAGE_OCID_OVERRIDE).data
             notify(f"指定镜像 OK: {img.display_name} ({img.id})")
-            resolved_image = IMAGE_OCID_OVERRIDE
+            image_override = IMAGE_OCID_OVERRIDE
         except oci.exceptions.ServiceError as e:
             if e.status == 404:
-                raise RuntimeError("找不到 IMAGE_OCID：很可能是别的 region 的镜像 ID；建议留空由脚本自动选择。")
+                raise RuntimeError("找不到 IMAGE_OCID：很可能是别的 region 的镜像。建议留空让脚本自动选择。")
             raise
-    else:
-        resolved_image = None
 
-    # 权限提示
+    # 最终提示
+    if SUBNET_OCID_ENV and region != base_cfg["region"]:
+        notify(f"⚠️ 发现你提供的 SUBNET 在 region={region}。建议把 Secrets 里的 OCI_REGION 更新为该值。")
+
     notify(
         "权限提示：若仍报 404/授权失败，请为你所在的 Group 在目标 compartment 配置：\n"
         "  allow group <YourGroup> to manage instance-family in compartment <YourCompartment>\n"
@@ -192,7 +238,7 @@ def validate_environment(cfg, compute, network, iam) -> Tuple[str, Optional[str]
         "  allow group <YourGroup> to read tenancy"
     )
 
-    return subnet_id, resolved_image
+    return cfg, region, subnet_id, image_override
 
 def try_launch(compute, network, compartment_id, subnet_id, image_id, ad_name, ocpus, mem_gb):
     from oci.core.models import (
@@ -247,7 +293,7 @@ def try_launch(compute, network, compartment_id, subnet_id, image_id, ad_name, o
         )
 
         atts = compute.list_vnic_attachments(
-            compartment_id=compartment_id,
+            compartment_id=COMPARTMENT_OCID,
             instance_id=inst_id
         ).data
         if not atts:
@@ -265,7 +311,7 @@ def try_launch(compute, network, compartment_id, subnet_id, image_id, ad_name, o
     except Exception as e:
         raise RuntimeError(f"EX:{type(e).__name__}: {e}")
 
-# ---- 主流程 ----
+# ========= 主流程 =========
 def main():
     miss = []
     if not COMPARTMENT_OCID: miss.append("COMPARTMENT_OCID")
@@ -277,17 +323,22 @@ def main():
         print(f"找不到 SSH 公钥：{SSH_PUBLIC_KEY_PATH}")
         sys.exit(1)
 
-    cfg, compute, network, iam = get_clients()
-    region = cfg["region"]
-    notify(f"开始蹲位：区域={region}")
+    base_cfg = get_base_cfg()
+    compute, network, iam = make_clients(base_cfg)
+    region0 = base_cfg["region"]
+    notify(f"开始蹲位：区域={region0}")
 
-    # 自检 + 解析子网/镜像
+    # 自检 + 可能切换 region + 解析子网/镜像
     try:
-        subnet_id, image_override = validate_environment(cfg, compute, network, iam)
+        cfg, region, subnet_id, image_override = validate_and_maybe_switch_region(base_cfg)
     except Exception as e:
         notify(f"❌ 环境自检失败：{e}")
         traceback.print_exc()
         sys.exit(1)
+
+    # 若 region 发生了切换，重建客户端
+    if region != region0:
+        compute, network, iam = make_clients(cfg)
 
     real_ads = list_availability_domains(iam, COMPARTMENT_OCID)
     ad_order = [ad for ad in ADS if any(ad == r for r in real_ads)] or real_ads or ADS
@@ -295,9 +346,9 @@ def main():
     image_id = image_override or pick_latest_ubuntu_arm_image(compute, COMPARTMENT_OCID)
     if not image_id:
         notify("未找到 Ubuntu 22.04/24.04 ARM 镜像。建议在 Secrets 里设置 IMAGE_OCID。")
-        sys.exit(0)  # 正常结束，留 run.log
+        sys.exit(0)
 
-    notify(f"使用子网：{subnet_id}")
+    notify(f"使用 region={region} 子网={subnet_id}")
     attempt = 0
     while True:
         for ad in ad_order:
