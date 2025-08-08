@@ -47,7 +47,7 @@ def notify(msg: str):
     print(msg, flush=True)
     if TG_BOT_TOKEN and TG_CHAT_ID:
         try:
-            import requests
+            import requests  # runtime import
             requests.post(
                 f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                 json={"chat_id": TG_CHAT_ID, "text": msg},
