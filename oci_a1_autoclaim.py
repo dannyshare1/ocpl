@@ -2,7 +2,7 @@
 """
 OCI A1 (ARM) Always Free 自动蹲位脚本
 - 轮询 AD-1/2/3，按 4→2→1 OCPU 递减重试
-- 自动/手动选择 Ubuntu 22.04 ARM 镜像（.env 的 IMAGE_OCID 优先生效）
+- 可自动/手动选择 Ubuntu 22.04 ARM 镜像（.env 的 IMAGE_OCID 优先生效）
 - 成功后输出实例 OCID & 公网 IP，并写入 SUCCESS.txt
 - 支持 Telegram 通知（可选）
 - 重要：COMPARTMENT_OCID 建议填 tenancy 根 OCID；SUBNET_OCID 填公共子网 OCID
@@ -111,7 +111,7 @@ def try_launch(compute, vcn, compartment_id, image_id, ad_name, ocpus, mem_gb):
 
     source = InstanceSourceViaImageDetails(
         image_id=image_id,
-        boot_volume_size_in_gbs=BOOT_VOLUME_GB,   # ← 正确位置
+        boot_volume_size_in_gbs=BOOT_VOLUME_GB,   # 正确位置
     )
 
     display_name = f"{INSTANCE_NAME_PREFIX}-ad{ad_name[-1]}-{ocpus}c{mem_gb}g"
@@ -148,8 +148,67 @@ def try_launch(compute, vcn, compartment_id, image_id, ad_name, ocpus, mem_gb):
             succeed_on_not_found=False,
         )
 
-        # 取公网 IP
-        atts = vcn.list_vnic_attachments(compartment_id, instance_id=inst_id).data
+        # 取公网 IP（先查 VNIC 附着，再取 VNIC）
+        atts = compute.list_vnic_attachments(compartment_id=compartment_id, instance_id=inst_id).data
         if not atts:
             raise RuntimeError("未找到 VNIC 附着")
         vnic = vcn.get_vnic(atts[0].vnic_id).data
+        return inst_id, vnic.public_ip
+
+    except oci.exceptions.ServiceError as e:
+        msg = (e.message or "").lower()
+        if any(k in msg for k in ["capacity", "outofhostcapacity", "out of capacity", "insufficient"]):
+            raise RuntimeError("CAPACITY")
+        raise RuntimeError(f"API:{e.status} {e.code} {e.message}")
+
+# ---------- 主流程 ----------
+def main():
+    miss = []
+    if not COMPARTMENT_OCID: miss.append("COMPARTMENT_OCID")
+    if not SUBNET_OCID: miss.append("SUBNET_OCID")
+    if miss:
+        print("缺少必要环境变量：", ", ".join(miss))
+        print("请在 .env 中设置（或由 Actions 工作流自动生成）：", ", ".join(miss))
+        sys.exit(1)
+
+    if not os.path.exists(SSH_PUBLIC_KEY_PATH):
+        print(f"找不到 SSH 公钥：{SSH_PUBLIC_KEY_PATH}")
+        sys.exit(1)
+
+    cfg, compute, vcn, iam = get_clients()
+    region = cfg["region"]
+    notify(f"开始蹲位：区域={region}")
+
+    # 优先使用实际存在的 AD 顺序
+    real_ads = list_availability_domains(iam, COMPARTMENT_OCID)
+    ad_order = [ad for ad in ADS if any(ad == r for r in real_ads)] or real_ads or ADS
+
+    # 镜像
+    image_id = IMAGE_OCID_OVERRIDE
+    if not image_id:
+        image_id = pick_latest_ubuntu_arm_image(compute, COMPARTMENT_OCID)
+    if not image_id:
+        notify("未找到 Ubuntu 22.04 ARM 镜像。请在 .env 里设置 IMAGE_OCID 后重试。")
+        sys.exit(1)
+
+    attempt = 0
+    while True:
+        for ad in ad_order:
+            for ocpu in OCPU_CANDIDATES:
+                mem = ocpu * MEM_PER_OCPU
+                attempt += 1
+                notify(f"[{attempt}] 尝试创建：AD={ad}  {ocpu} OCPU / {mem} GB")
+                try:
+                    inst, ip = try_launch(compute, vcn, COMPARTMENT_OCID, image_id, ad, ocpu, mem)
+                    notify(f"✅ 成功！实例：{inst}\n公网 IP：{ip}")
+                    with open("SUCCESS.txt", "w", encoding="utf-8") as f:
+                        f.write(f"{inst}\n{ip}\n")
+                    return
+                except RuntimeError as e:
+                    if str(e) == "CAPACITY":
+                        notify(f"⚠️ 容量不足（{ad} {ocpu}c/{mem}g），{SLEEP_SECONDS}s 后继续…")
+                        time.sleep(SLEEP_SECONDS)
+                    else:
+                        notify(f"❌ 其他错误：{e}\n{SLEEP_SECONDS}s 后继续…")
+                        time.sleep(SLEEP_SECONDS)
+                except Exception as e:
