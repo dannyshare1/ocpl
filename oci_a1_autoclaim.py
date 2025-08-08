@@ -22,8 +22,8 @@ load_dotenv()
 CONFIG_FILE = os.path.expanduser(os.getenv("OCI_CONFIG_FILE", "~/.oci/config"))
 PROFILE = os.getenv("OCI_PROFILE", "DEFAULT")
 
-COMPARTMENT_OCID = os.getenv("COMPARTMENT_OCID")
-SUBNET_OCID_ENV = os.getenv("SUBNET_OCID")  # 可为空或来自其他 region
+COMPARTMENT_OCID = os.getenv("COMPARTMENT_OCID")  # 支持填写根租户 ocid1.tenancy... 作为 root compartment
+SUBNET_OCID_ENV = os.getenv("SUBNET_OCID")        # 可为空或来自其他 region
 SSH_PUBLIC_KEY_PATH = os.path.expanduser(os.getenv("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_rsa.pub"))
 
 IMAGE_OCID_OVERRIDE = (os.getenv("IMAGE_OCID") or "").strip()
@@ -119,7 +119,6 @@ def describe_subnet(s: oci.core.models.Subnet) -> str:
 def resolve_subnet_in_region(network, compartment_id, region: str, wanted_subnet_id: Optional[str]) -> Tuple[Optional[str], List[str]]:
     """在指定 region 尝试解析子网，返回(子网ID或None, 该region下子网清单文本行列表)"""
     lines: List[str] = []
-    # 先看传入的 SUBNET_OCID 是否存在于本 region
     if wanted_subnet_id:
         try:
             s = network.get_subnet(wanted_subnet_id).data
@@ -129,8 +128,6 @@ def resolve_subnet_in_region(network, compartment_id, region: str, wanted_subnet
         except oci.exceptions.ServiceError as e:
             if e.status != 404:
                 raise
-
-    # 列表用于提示
     subs = list_subnets_in_compartment(network, compartment_id)
     if subs:
         lines.append(f"region={region} 下可见子网：")
@@ -162,10 +159,10 @@ def validate_and_maybe_switch_region(base_cfg) -> Tuple[dict, str, str, Optional
     try:
         if COMPARTMENT_OCID and COMPARTMENT_OCID.startswith("ocid1.tenancy"):
             ten = iam.get_tenancy(COMPARTMENT_OCID).data
-            notify(f"Tenancy (作为根 compartment 使用): {ten.name} ({ten.id}) - 状态: {ten.lifecycle_state}")
+            notify(f"Tenancy (作为根 compartment 使用): {ten.name} ({ten.id})")
         else:
             comp = iam.get_compartment(COMPARTMENT_OCID).data
-            notify(f"Compartment: {comp.name} ({comp.id}) - 状态: {comp.lifecycle_state}")
+            notify(f"Compartment: {comp.name} ({comp.id})")
     except oci.exceptions.ServiceError as e:
         if e.status == 404:
             raise RuntimeError("找不到 COMPARTMENT_OCID（不在本租户/本区域可见），或无读取权限。")
@@ -177,7 +174,7 @@ def validate_and_maybe_switch_region(base_cfg) -> Tuple[dict, str, str, Optional
         notify(ln)
 
     if subnet_id is None and SUBNET_OCID_ENV and AUTO_SWITCH_REGION:
-        # 在已订阅的其它 region 里寻找这个 SUBNET_OCID
+        # 在其它订阅 region 里寻找这个 SUBNET_OCID
         notify("在当前 region 未找到提供的 SUBNET_OCID，开始遍历租户已订阅的其它 region …")
         subs = iam.list_region_subscriptions(cfg["tenancy"]).data
         for rs in subs:
