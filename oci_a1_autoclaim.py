@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OCI A1 (ARM) Always Free 自动蹲位脚本
+OCI A1 (ARM) Always Free 自动蹲位脚本（带环境自检）
 """
 
 import base64
@@ -47,7 +47,7 @@ def notify(msg: str):
     print(msg, flush=True)
     if TG_BOT_TOKEN and TG_CHAT_ID:
         try:
-            import requests  # runtime import
+            import requests
             requests.post(
                 f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                 json={"chat_id": TG_CHAT_ID, "text": msg},
@@ -88,6 +88,56 @@ def pick_latest_ubuntu_arm_image(compute, compartment_id) -> Optional[str]:
         return None
 
     return pick("22.04") or pick("24.04")
+
+def validate_environment(cfg, compute, network, iam):
+    """在尝试创建实例前做全面自检，定位 404/权限错误的根因"""
+    region = cfg.get("region")
+    notify(f"区域(region) = {region}")
+    # 1) 当前 API key 所属用户/租户
+    try:
+        whoami = iam.get_user(cfg["user"]).data
+        notify(f"当前用户: {whoami.name} ({whoami.id})")
+    except Exception as e:
+        raise RuntimeError(f"无法读取当前用户信息，请检查 OCI 配置/密钥是否正确：{e}")
+
+    # 2) compartment 是否存在且可见
+    try:
+        comp = iam.get_compartment(COMPARTMENT_OCID).data
+        notify(f"Compartment: {comp.name} ({comp.id}) - 状态: {comp.lifecycle_state}")
+    except oci.exceptions.ServiceError as e:
+        if e.status == 404:
+            raise RuntimeError("找不到 COMPARTMENT_OCID（不在本租户/本区域可见），或无读取权限（需要 'read tenancy' 或对该 compartment 的 read 权限）。")
+        raise
+
+    # 3) subnet 是否存在（且通常是区域级资源，必须在同一个 region）
+    try:
+        subnet = network.get_subnet(SUBNET_OCID).data
+        notify(f"Subnet: {subnet.display_name} ({subnet.id}) - VCN: {subnet.vcn_id}")
+    except oci.exceptions.ServiceError as e:
+        if e.status == 404:
+            raise RuntimeError("找不到 SUBNET_OCID：请确认该 Subnet 位于当前 region，且你有 use virtual-network-family 权限。")
+        raise
+
+    # 4) image 是否存在（若提供了 override）
+    if IMAGE_OCID_OVERRIDE:
+        try:
+            img = compute.get_image(IMAGE_OCID_OVERRIDE).data
+            notify(f"指定镜像 OK: {img.display_name} ({img.id})")
+        except oci.exceptions.ServiceError as e:
+            if e.status == 404:
+                raise RuntimeError("找不到 IMAGE_OCID：很可能是别的 region 的镜像 ID；建议留空由脚本自动选择。")
+            raise
+
+    # 5) 权限建议：多数 404 实为权限不足
+    #   - manage instance-family + use virtual-network-family in compartment
+    #   - read tenancy (便于读取 AD、compartment 信息)
+    notify(
+        "权限提示：若仍报 404/授权失败，请为你所在的 Group 在目标 compartment 配置：\n"
+        "  allow group <YourGroup> to manage instance-family in compartment <YourCompartment>\n"
+        "  allow group <YourGroup> to use virtual-network-family in compartment <YourCompartment>\n"
+        "  allow group <YourGroup> to read tenancy\n"
+        "并确认 Subnet/Compartment/镜像与当前 region 一致。"
+    )
 
 def try_launch(compute, network, compartment_id, image_id, ad_name, ocpus, mem_gb):
     from oci.core.models import (
@@ -152,6 +202,9 @@ def try_launch(compute, network, compartment_id, image_id, ad_name, ocpus, mem_g
 
     except oci.exceptions.ServiceError as e:
         msg = (e.message or "").lower()
+        # 404、授权失败等
+        if e.status == 404 or "notauthorized" in msg or "not found" in msg:
+            raise RuntimeError("AUTH_OR_NOTFOUND: 请检查 COMPARTMENT_OCID / SUBNET_OCID / IMAGE_OCID 是否在本 region 且你有权限。")
         if any(k in msg for k in ["capacity", "outofhostcapacity", "out of capacity", "insufficient"]):
             raise RuntimeError("CAPACITY")
         raise RuntimeError(f"API:{e.status} {e.code} {e.message}")
@@ -173,6 +226,14 @@ def main():
     cfg, compute, network, iam = get_clients()
     region = cfg["region"]
     notify(f"开始蹲位：区域={region}")
+
+    # 先做自检，把 404/权限问题前置暴露
+    try:
+        validate_environment(cfg, compute, network, iam)
+    except Exception as e:
+        notify(f"❌ 环境自检失败：{e}")
+        traceback.print_exc()
+        sys.exit(1)
 
     real_ads = list_availability_domains(iam, COMPARTMENT_OCID)
     ad_order = [ad for ad in ADS if any(ad == r for r in real_ads)] or real_ads or ADS
@@ -196,9 +257,13 @@ def main():
                         f.write(f"{inst}\n{ip}\n")
                     return
                 except RuntimeError as e:
-                    if str(e) == "CAPACITY":
+                    msg = str(e)
+                    if msg == "CAPACITY":
                         notify(f"⚠️ 容量不足（{ad} {ocpu}c/{mem}g），{SLEEP_SECONDS}s 后继续…")
                         time.sleep(SLEEP_SECONDS)
+                    elif msg.startswith("AUTH_OR_NOTFOUND"):
+                        notify("❌ 授权/资源不可见问题：请检查 region/OCID/权限（见上方自检提示），脚本将暂停。")
+                        return
                     else:
                         notify(f"❌ 其他错误：{e}\n{SLEEP_SECONDS}s 后继续…")
                         time.sleep(SLEEP_SECONDS)
