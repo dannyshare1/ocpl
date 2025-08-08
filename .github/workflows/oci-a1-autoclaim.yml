@@ -2,19 +2,17 @@ name: OCI A1 Auto-Claim
 
 on:
   workflow_dispatch: {}
-  # schedule:
-  #   - cron: "*/10 * * * *"   # 确认无误后再打开定时
-  push:
-    branches: [ "main" ]
+  schedule:
+    - cron: "*/10 * * * *"   # 每 10 分钟触发一次（UTC）
 
 concurrency:
   group: oci-a1-autoclaim
-  cancel-in-progress: true
+  cancel-in-progress: false  # 不取消正在运行的，新的排队等待
 
 jobs:
   claim:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 360      # 单次最多 6 小时
     permissions:
       contents: read
     env:
@@ -102,13 +100,6 @@ jobs:
           EOF
           echo "==== generated .env ===="
           sed -n '1,12p' .env
-
-      - name: Telegram test ping
-        if: ${{ env.TG_BOT_TOKEN != '' && env.TG_CHAT_ID != '' }}
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" \
-            -d text="OCI A1 workflow started ✅ on $GITHUB_REPOSITORY ($GITHUB_RUN_ID)"
 
       - name: Run auto-claim (tee to log)
         run: |
