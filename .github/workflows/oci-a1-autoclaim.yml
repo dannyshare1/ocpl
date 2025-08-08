@@ -2,10 +2,10 @@ name: OCI A1 Auto-Claim
 
 on:
   workflow_dispatch: {}
-  push:
-    branches: [ "main" ]   # 往 main 推就触发
   # schedule:
-  #   - cron: "*/10 * * * *"  # 确认无误后再打开定时
+  #   - cron: "*/10 * * * *"   # 确认无误后再打开定时
+  push:
+    branches: [ "main" ]       # 往 main 推一次也会触发（用于“Run没反应”的情况）
 
 concurrency:
   group: oci-a1-autoclaim
@@ -32,16 +32,23 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
+      # 用 Bash 变量检查，不用 GitHub 表达式索引（避免你遇到的 secrets[k] 错误）
       - name: Check required secrets
         shell: bash
         env:
-          MUST: "OCI_USER_OCID OCI_TENANCY_OCID OCI_FINGERPRINT OCI_REGION OCI_PRIVATE_KEY_PEM COMPARTMENT_OCID SUBNET_OCID SSH_PUBLIC_KEY"
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY_PEM: ${{ secrets.OCI_PRIVATE_KEY_PEM }}
+          COMPARTMENT_OCID: ${{ secrets.COMPARTMENT_OCID }}
+          SUBNET_OCID: ${{ secrets.SUBNET_OCID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           missing=0
-          for k in $MUST; do
-            v="${{ secrets[k] }}"
-            if [ -z "$v" ]; then
-              echo "::error::Missing secret: $k"
+          for var in OCI_USER_OCID OCI_TENANCY_OCID OCI_FINGERPRINT OCI_REGION OCI_PRIVATE_KEY_PEM COMPARTMENT_OCID SUBNET_OCID SSH_PUBLIC_KEY; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Missing secret: $var"
               missing=1
             fi
           done
@@ -93,7 +100,7 @@ jobs:
           TG_CHAT_ID=${TG_CHAT_ID}
           EOF
           echo "==== generated .env ===="
-          sed -n '1,8p' .env
+          sed -n '1,10p' .env
 
       - name: Run auto-claim
         run: python oci_a1_autoclaim.py
