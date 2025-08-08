@@ -3,7 +3,7 @@ name: OCI A1 Auto-Claim
 on:
   workflow_dispatch: {}
   # schedule:
-  #   - cron: "*/10 * * * *"
+  #   - cron: "*/10 * * * *"   # 确认无误后再打开定时
   push:
     branches: [ "main" ]
 
@@ -14,7 +14,7 @@ concurrency:
 jobs:
   claim:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
       contents: read
 
@@ -101,12 +101,27 @@ jobs:
           echo "==== generated .env ===="
           sed -n '1,10p' .env
 
-      - name: Run auto-claim
-        run: python oci_a1_autoclaim.py
+      # 可选：先发一条 TG 测试消息，确认 token/chat_id 没问题
+      - name: Telegram test ping
+        if: ${{ secrets.TG_BOT_TOKEN != '' && secrets.TG_CHAT_ID != '' }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TG_CHAT_ID }}" \
+            -d text="OCI A1 workflow started ✅ on $GITHUB_REPOSITORY ($GITHUB_RUN_ID)"
 
-      - name: Upload SUCCESS.txt
-        if: ${{ always() && hashFiles('SUCCESS.txt') != '' }}
+      # 把运行输出同时写到 run.log，方便事后排查
+      - name: Run auto-claim (tee to log)
+        run: |
+          set -o pipefail
+          python oci_a1_autoclaim.py |& tee run.log
+
+      # 无论是否成功都把 run.log 上传；SUCCESS.txt 若不存在会被忽略
+      - name: Upload logs
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: success
-          path: SUCCESS.txt
+          name: run-logs
+          path: |
+            run.log
+            SUCCESS.txt
+          if-no-files-found: warn
