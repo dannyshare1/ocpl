@@ -3,7 +3,7 @@ name: OCI A1 Auto-Claim
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/10 * * * *"   # 每 10 分钟触发一次（UTC）
+    - cron: "0 */2 * * *"   # 每 2 小时触发一次（UTC）
 
 concurrency:
   group: oci-a1-autoclaim
